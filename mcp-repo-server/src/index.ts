@@ -16,4 +16,15 @@ server.tool(
   },
 );
 
+server.tool(
+  "git_status",
+  "List staged, modified, deleted and untracked files",
+  {},
+  async () => {
+    const s = await git.status();
+    const out = { staged: s.staged, modified: s.modified, deleted: s.deleted, created: s.created, untracked: s.not_added };
+    return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+  }
+);
+
 await server.connect(new StdioServerTransport());
