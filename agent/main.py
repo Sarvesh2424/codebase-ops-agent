@@ -1,4 +1,5 @@
 import asyncio
+import sys, termios
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_groq import ChatGroq
 from typing import Annotated, TypedDict
@@ -8,6 +9,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import interrupt, Command
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 
 class State(TypedDict):
@@ -17,6 +19,11 @@ class State(TypedDict):
     verdict: str
     attempts: int
     notes: str
+
+
+def ask(prompt: str) -> str:
+    termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    return input(prompt)
 
 
 async def main():
@@ -31,7 +38,7 @@ async def main():
         }
     )
     tools = await client.get_tools()
-    llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
+    llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0, max_retries=6)
     llm_with_tools = llm.bind_tools(tools)
 
     tool_desc = "\n".join(f"- {t.name}: {t.description}" for t in tools)
@@ -50,7 +57,10 @@ async def main():
     async def investigator(state: State):
         system = SystemMessage(
             f"Follow this plan using the tools, then write concise findings. "
+            f"Never do arithmetic yourself: quote totals exactly as given by tool output, "
+            f"and report tracked and untracked totals separately instead of combining them. "
             f"Do not paste raw diffs unless the user asks for them.\nPlan:\n{state['plan']}"
+            f"The git_diff_stats totals include deleted files; do not attribute them only to modified files. "
         )
         resp = await llm_with_tools.ainvoke([system, *state["messages"]])
         return {"messages": [resp]}
@@ -139,20 +149,37 @@ async def main():
         "reviewer", after_reviewer, ["human_gate", "investigator", END]
     )
     builder.add_conditional_edges("human_gate", after_human, ["investigator", END])
-    agent = builder.compile(checkpointer=InMemorySaver())
-    config = {"configurable": {"thread_id": "run-1"}}
-    res = await agent.ainvoke(
-        {"messages": "Summarize my uncommitted changes", "attempts": 0}, config
-    )
+    async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as saver:
+        agent = builder.compile(checkpointer=saver)
+        thread_id = sys.argv[1] if len(sys.argv) > 1 else "run-1"
+        config = {"configurable": {"thread_id": thread_id}}
 
-    while "__interrupt__" in res:
-        print(res["__interrupt__"][0].value["findings"])
-        answer = input("\nAccept? (yes / feedback): ")
-        res = await agent.ainvoke(Command(resume=answer), config)
+        snap = await agent.aget_state(config)
+        if snap.values and not snap.next:
+            print(f"Thread '{thread_id}' already finished. Use a new thread ID.")
+            return
+        if snap.next:
+            interrupts = snap.tasks[0].interrupts
+            res = (
+                {"__interrupt__": interrupts}
+                if interrupts
+                else await agent.ainvoke(None, config)
+            )
+        else:
+            res = await agent.ainvoke(
+                {"messages": "Summarize my uncommitted changes", "attempts": 0}, config
+            )
 
-    print("\nVERDICT:", res["verdict"])
-    print("REVIEWER NOTES:", res.get("notes", ""))
-    print(res["findings"])
+        while "__interrupt__" in res:
+            print(res["__interrupt__"][0].value["findings"])
+            answer = ask("\nType 'yes' to accept, or type what to change: ")
+            res = await agent.ainvoke(Command(resume=answer), config)
+
+        print("\nVERDICT:", res["verdict"])
+        print(res["findings"])
 
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    print("\nPaused. Re-run with the same thread ID to resume.")
